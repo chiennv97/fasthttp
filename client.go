@@ -978,7 +978,6 @@ func (c *HostClient) Do(req *Request, resp *Response) error {
 		if err == nil || !retry {
 			break
 		}
-
 		if !isIdempotent(req) {
 			// Retry non-idempotent requests if the server closes
 			// the connection before sending the response.
@@ -1003,7 +1002,85 @@ func (c *HostClient) Do(req *Request, resp *Response) error {
 	}
 	return err
 }
+func (c *HostClient) Do2(req *Request, resp *Response, messages chan *Response, id string) error {
+	var err error
+	var retry bool
+	const maxAttempts = 5
+	attempts := 0
 
+	atomic.AddUint64(&c.pendingRequests, 1)
+	for {
+		retry, err = c.do2(req, resp, messages)
+		if err == nil || !retry {
+			break
+		}
+
+		if !isIdempotent(req) {
+			// Retry non-idempotent requests if the server closes
+			// the connection before sending the response.
+			//
+			// This case is possible if the server closes the idle
+			// keep-alive connection on timeout.
+			//
+			// Apache and nginx usually do this.
+			if err != io.EOF {
+				break
+			}
+		}
+		attempts++
+		if attempts >= maxAttempts {
+			break
+		}
+	}
+	atomic.AddUint64(&c.pendingRequests, ^uint64(0))
+
+	if err == io.EOF {
+		err = ErrConnectionClosed
+	}
+	//messages <- resp
+	//fmt.Println("tra ve" + id)
+	//fmt.Println(err)
+	return err
+}
+func (c *HostClient) Ping() bool {
+	var err error
+	var retry bool
+	const maxAttempts = 5
+	//attempts := 0
+	atomic.AddUint64(&c.pendingRequests, 1)
+	for {
+		retry, err = c.doPing()
+		if err == nil || !retry {
+			break
+		}
+
+		//if !isIdempotent(req) {
+		//	// Retry non-idempotent requests if the server closes
+		//	// the connection before sending the response.
+		//	//
+		//	// This case is possible if the server closes the idle
+		//	// keep-alive connection on timeout.
+		//	//
+		//	// Apache and nginx usually do this.
+		//	if err != io.EOF {
+		//		break
+		//	}
+		//}
+		//attempts++
+		//if attempts >= maxAttempts {
+		//	break
+		//}
+	}
+	atomic.AddUint64(&c.pendingRequests, ^uint64(0))
+
+	if err == io.EOF {
+		err = ErrConnectionClosed
+	}
+	if err == nil {
+		return true
+	}
+	return false
+}
 // PendingRequests returns the current number of requests the client
 // is executing.
 //
@@ -1017,9 +1094,10 @@ func isIdempotent(req *Request) bool {
 	return req.Header.IsGet() || req.Header.IsHead() || req.Header.IsPut()
 }
 
-func (c *HostClient) do(req *Request, resp *Response) (bool, error) {
+func (c *HostClient) do(req *Request, resp *Response )(bool, error) {
 	nilResp := false
 	if resp == nil {
+		//fmt.Println("vao resp nil")
 		nilResp = true
 		resp = AcquireResponse()
 	}
@@ -1032,7 +1110,31 @@ func (c *HostClient) do(req *Request, resp *Response) (bool, error) {
 
 	return ok, err
 }
+func (c *HostClient) do2(req *Request, resp *Response, messages chan *Response)(bool, error) {
+	nilResp := false
+	if resp == nil {
+		//fmt.Println("vao resp nil")
+		nilResp = true
+		resp = AcquireResponse()
+	}
 
+	ok, err := c.doNonNilReqResp2(req, resp, messages)
+
+	if nilResp {
+		ReleaseResponse(resp)
+	}
+	//messages <- resp
+	//fmt.Println(resp)
+	return ok, err
+}
+func (c *HostClient) doPing() (bool, error) {
+	//nilResp := false
+
+	ok, err := c.doNonNilReqRespPing()
+
+
+	return ok, err
+}
 func (c *HostClient) doNonNilReqResp(req *Request, resp *Response) (bool, error) {
 	if req == nil {
 		panic("BUG: req cannot be nil")
@@ -1045,12 +1147,17 @@ func (c *HostClient) doNonNilReqResp(req *Request, resp *Response) (bool, error)
 
 	// Free up resources occupied by response before sending the request,
 	// so the GC may reclaim these resources (e.g. response body).
+	//fmt.Println("vao doNonNilReqResp")
 	resp.Reset()
-
 	cc, err := c.acquireConn()
 	if err != nil {
+		//fmt.Println("this")
 		return false, err
 	}
+	//if err == nil {
+	//	fmt.Println("ko loi")
+	//	return true, err
+	//}
 	conn := cc.c
 
 	if c.WriteTimeout > 0 {
@@ -1131,7 +1238,145 @@ func (c *HostClient) doNonNilReqResp(req *Request, resp *Response) (bool, error)
 	} else {
 		c.releaseConn(cc)
 	}
+	return false, err
+}
+func (c *HostClient) doNonNilReqResp2(req *Request, resp *Response,messages chan *Response) (bool, error) {
+	if req == nil {
+		panic("BUG: req cannot be nil")
+	}
+	if resp == nil {
+		panic("BUG: resp cannot be nil")
+	}
 
+	atomic.StoreUint32(&c.lastUseTime, uint32(CoarseTimeNow().Unix()-startTimeUnix))
+
+	// Free up resources occupied by response before sending the request,
+	// so the GC may reclaim these resources (e.g. response body).
+	resp.Reset()
+	cc, err := c.acquireConn()
+	if err != nil {
+		fmt.Println("this 1")
+		resp.SetStatusCode(400)
+		messages <- resp
+		return false, err
+	}
+	//if err == nil {
+	//	fmt.Println("ko loi")
+	//	return true, err
+	//}
+	conn := cc.c
+
+	if c.WriteTimeout > 0 {
+		// Optimization: update write deadline only if more than 25%
+		// of the last write deadline exceeded.
+		// See https://github.com/golang/go/issues/15133 for details.
+		currentTime := CoarseTimeNow()
+		if currentTime.Sub(cc.lastWriteDeadlineTime) > (c.WriteTimeout >> 2) {
+			if err = conn.SetWriteDeadline(currentTime.Add(c.WriteTimeout)); err != nil {
+				c.closeConn(cc)
+				fmt.Println("this 2")
+				resp.SetStatusCode(400)
+				messages <- resp
+				return true, err
+			}
+			cc.lastWriteDeadlineTime = currentTime
+		}
+	}
+
+	resetConnection := false
+	if c.MaxConnDuration > 0 && time.Since(cc.createdTime) > c.MaxConnDuration && !req.ConnectionClose() {
+		req.SetConnectionClose()
+		resetConnection = true
+	}
+
+	userAgentOld := req.Header.UserAgent()
+	if len(userAgentOld) == 0 {
+		req.Header.userAgent = c.getClientName()
+	}
+	bw := c.acquireWriter(conn)
+	err = req.Write(bw)
+	if len(userAgentOld) == 0 {
+		req.Header.userAgent = userAgentOld
+	}
+
+	if resetConnection {
+		req.Header.ResetConnectionClose()
+	}
+
+	if err == nil {
+		err = bw.Flush()
+	}
+	if err != nil {
+		c.releaseWriter(bw)
+		c.closeConn(cc)
+		fmt.Println("this 3")
+		resp.SetStatusCode(400)
+		messages <- resp
+		return true, err
+	}
+	c.releaseWriter(bw)
+	//fmt.Println(bw)
+	if c.ReadTimeout > 0 {
+		// Optimization: update read deadline only if more than 25%
+		// of the last read deadline exceeded.
+		// See https://github.com/golang/go/issues/15133 for details.
+		currentTime := CoarseTimeNow()
+		if currentTime.Sub(cc.lastReadDeadlineTime) > (c.ReadTimeout >> 2) {
+			if err = conn.SetReadDeadline(currentTime.Add(c.ReadTimeout)); err != nil {
+				c.closeConn(cc)
+				fmt.Println("this 4")
+				resp.SetStatusCode(400)
+				messages <- resp
+				return true, err
+			}
+			cc.lastReadDeadlineTime = currentTime
+		}
+	}
+
+	if !req.Header.IsGet() && req.Header.IsHead() {
+		resp.SkipBody = true
+	}
+	if c.DisableHeaderNamesNormalizing {
+		resp.Header.DisableNormalizing()
+	}
+
+	br := c.acquireReader(conn)
+	if err = resp.ReadLimitBody(br, c.MaxResponseBodySize); err != nil {
+		c.releaseReader(br)
+		c.closeConn(cc)
+		fmt.Println("this 5")
+		resp.SetStatusCode(400)
+		messages <- resp
+		return true, err
+	}
+	c.releaseReader(br)
+
+	if resetConnection || req.ConnectionClose() || resp.ConnectionClose() {
+		c.closeConn(cc)
+	} else {
+		c.releaseConn(cc)
+	}
+	fmt.Println("this 6")
+	messages <- resp
+	return false, err
+}
+func (c *HostClient) doNonNilReqRespPing() (bool, error) {
+
+
+	atomic.StoreUint32(&c.lastUseTime, uint32(CoarseTimeNow().Unix()-startTimeUnix))
+
+	// Free up resources occupied by response before sending the request,
+	// so the GC may reclaim these resources (e.g. response body).
+	//resp.Reset()
+	_, err := c.acquireConn()
+	if err != nil {
+		fmt.Println("this")
+		return false, err
+	}
+	if err == nil {
+		fmt.Println("ko loi")
+		return true, err
+	}
 	return false, err
 }
 
@@ -1141,7 +1386,7 @@ var (
 	//
 	// Increase the allowed number of connections per host if you
 	// see this error.
-	ErrNoFreeConns = errors.New("no free connections available to host")
+	ErrNoFreeConns = errors.New("501")
 
 	// ErrTimeout is returned from timed out calls.
 	ErrTimeout = errors.New("timeout")
@@ -1199,6 +1444,7 @@ func (c *HostClient) acquireConn() (*clientConn, error) {
 
 	conn, err := c.dialHostHard()
 	if err != nil {
+		//fmt.Println("not nil")
 		c.decConnsCount()
 		return nil, err
 	}
@@ -1410,7 +1656,7 @@ func (c *HostClient) dialHostHard() (conn net.Conn, err error) {
 	c.addrsLock.Lock()
 	n := len(c.addrs)
 	c.addrsLock.Unlock()
-
+	//fmt.Println("dialHostHard")
 	if n == 0 {
 		// It looks like c.addrs isn't initialized yet.
 		n = 1
@@ -1464,9 +1710,11 @@ func dialAddr(addr string, dial DialFunc, dialDualStack, isTLS bool, tlsConfig *
 		}
 		addr = addMissingPort(addr, isTLS)
 	}
+
 	conn, err := dial(addr)
 	if err != nil {
-		return nil, err
+		//fmt.Println("dialAddr")
+		return nil, errors.New("502")
 	}
 	if conn == nil {
 		panic("BUG: DialFunc returned (nil, nil)")
